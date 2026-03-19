@@ -84,7 +84,7 @@ async def send_notification(bot, message):
     try:
         await bot.send_message(
             chat_id=NOTIFICATION_CHAT_ID,
-            text=f"🚨 *Watcher Alert*\n\n{message}",
+            text=f"*Watcher Alert*\n\n{message}",
             parse_mode='Markdown'
         )
     except TelegramError as e:
@@ -102,7 +102,7 @@ async def run_checks():
     for address in IP_ADDRESSES_TO_PING:
         print(f"Checking IP/domain: {address}")
         if not await ping_ip(address):
-            failure_msg = f"❌ IP/Domain failed: `{address}`"
+            failure_msg = f"IP/Domain failed: `{address}`"
             failures.append(failure_msg)
             print(f"  FAILED")
         else:
@@ -112,7 +112,7 @@ async def run_checks():
     for chat_id in TELEGRAM_BOTS_TO_PING:
         print(f"Checking Telegram bot: {chat_id}")
         if not await ping_telegram_bot(bot, chat_id):
-            failure_msg = f"❌ Telegram bot failed: `{chat_id}`"
+            failure_msg = f"Telegram bot failed: `{chat_id}`"
             failures.append(failure_msg)
             print(f"  FAILED")
         else:
@@ -124,7 +124,7 @@ async def run_checks():
         print(f"\nSending notification about {len(failures)} failure(s)")
         await send_notification(bot, notification)
     else:
-        print("\nAll checks passed ✓")
+        print("\nAll checks passed")
 
 
 async def main():
