@@ -1,0 +1,14 @@
+[Unit]
+Description=Watcher - IP and Telegram Bot Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/watcher
+ExecStart=/path/to/python3 /path/to/watcher/watcher.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
