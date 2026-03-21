@@ -5,14 +5,14 @@ Sends notifications via Telegram when failures are detected.
 """
 
 import os
-import time
 import subprocess
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Bot
-from telegram.ext import Application, MessageHandler, filters
 from telegram.error import TelegramError
+from telethon import TelegramClient, events
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +20,10 @@ load_dotenv()
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 NOTIFICATION_CHAT_ID = os.getenv('NOTIFICATION_CHAT_ID')
+TELEGRAM_API_ID = int(os.getenv('TELEGRAM_API_ID', '0'))
+TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
+TELEGRAM_PHONE = os.getenv('TELEGRAM_PHONE')
+TELETHON_SESSION_PATH = os.getenv('TELETHON_SESSION_PATH', './data/telegram_session')
 TELEGRAM_BOTS_TO_PING = os.getenv('TELEGRAM_BOTS_TO_PING', '').split(',')
 IP_ADDRESSES_TO_PING = os.getenv('IP_ADDRESSES_TO_PING', '').split(',')
 CHECK_INTERVAL_HOURS = int(os.getenv('CHECK_INTERVAL_HOURS', '24'))
@@ -29,9 +33,6 @@ TELEGRAM_RESPONSE_TIMEOUT = int(os.getenv('TELEGRAM_RESPONSE_TIMEOUT', '30'))
 # Filter empty strings
 TELEGRAM_BOTS_TO_PING = [bot.strip() for bot in TELEGRAM_BOTS_TO_PING if bot.strip()]
 IP_ADDRESSES_TO_PING = [ip.strip() for ip in IP_ADDRESSES_TO_PING if ip.strip()]
-
-# Store bot responses
-bot_responses = {}
 
 
 async def ping_ip(address):
@@ -48,35 +49,27 @@ async def ping_ip(address):
         return False
 
 
-async def ping_telegram_bot(bot, chat_id):
-    """Send ping to a Telegram bot and wait for response."""
+async def check_telegram_bot(client, username):
+    """Send ping to a bot via personal account and wait for a reply."""
+    response_received = asyncio.Event()
+
+    @client.on(events.NewMessage(from_users=username))
+    async def handler(event):
+        if event.message.text.strip().lower() == "ping":
+            response_received.set()
+
     try:
-        # Clear previous response
-        bot_responses[chat_id] = None
-
-        # Send ping message
-        await bot.send_message(chat_id=chat_id, text="ping")
-
-        # Wait for response
-        start_time = time.time()
-        while time.time() - start_time < TELEGRAM_RESPONSE_TIMEOUT:
-            if bot_responses.get(chat_id) == "ping":
-                return True
-            await asyncio.sleep(0.5)
-
+        await client.send_message(username, "ping")
+        try:
+            await asyncio.wait_for(response_received.wait(), timeout=TELEGRAM_RESPONSE_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            return False
+    except Exception as e:
+        print(f"Error pinging Telegram bot {username}: {e}")
         return False
-    except TelegramError as e:
-        print(f"Error pinging Telegram bot {chat_id}: {e}")
-        return False
-
-
-async def handle_message(update, context):
-    """Handle incoming messages from bots."""
-    chat_id = str(update.effective_chat.id)
-    message_text = update.message.text.lower().strip() if update.message.text else ""
-
-    if message_text == "ping":
-        bot_responses[chat_id] = "ping"
+    finally:
+        client.remove_event_handler(handler)
 
 
 async def send_notification(bot, message):
@@ -91,7 +84,7 @@ async def send_notification(bot, message):
         print(f"Error sending notification: {e}")
 
 
-async def run_checks():
+async def run_checks(client):
     """Run all monitoring checks."""
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     failures = []
@@ -102,18 +95,16 @@ async def run_checks():
     for address in IP_ADDRESSES_TO_PING:
         print(f"Checking IP/domain: {address}")
         if not await ping_ip(address):
-            failure_msg = f"IP/Domain failed: `{address}`"
-            failures.append(failure_msg)
+            failures.append(f"IP/Domain failed: `{address}`")
             print(f"  FAILED")
         else:
             print(f"  OK")
 
     # Check Telegram bots
-    for chat_id in TELEGRAM_BOTS_TO_PING:
-        print(f"Checking Telegram bot: {chat_id}")
-        if not await ping_telegram_bot(bot, chat_id):
-            failure_msg = f"Telegram bot failed: `{chat_id}`"
-            failures.append(failure_msg)
+    for username in TELEGRAM_BOTS_TO_PING:
+        print(f"Checking Telegram bot: {username}")
+        if not await check_telegram_bot(client, username):
+            failures.append(f"Telegram bot failed: `{username}`")
             print(f"  FAILED")
         else:
             print(f"  OK")
@@ -133,29 +124,25 @@ async def main():
         print("ERROR: TELEGRAM_BOT_TOKEN and NOTIFICATION_CHAT_ID must be set in .env")
         return
 
-    # Set up Telegram bot application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
+        print("ERROR: TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_PHONE must be set in .env")
+        return
 
-    # Add message handler for bot responses
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    Path(TELETHON_SESSION_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-    # Start the bot
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+    client = TelegramClient(TELETHON_SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    await client.start(phone=TELEGRAM_PHONE)
 
     print("Watcher started!")
     print(f"Monitoring {len(IP_ADDRESSES_TO_PING)} IP/domain(s) and {len(TELEGRAM_BOTS_TO_PING)} Telegram bot(s)")
     print(f"Check interval: {CHECK_INTERVAL_HOURS} hour(s)")
 
-    # Run checks in a loop
     while True:
         try:
-            await run_checks()
+            await run_checks(client)
         except Exception as e:
             print(f"Error during checks: {e}")
 
-        # Wait for next check interval
         print(f"\nNext check in {CHECK_INTERVAL_HOURS} hour(s)...")
         await asyncio.sleep(CHECK_INTERVAL_HOURS * 3600)
 
