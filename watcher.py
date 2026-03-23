@@ -52,21 +52,37 @@ async def ping_ip(address):
 async def check_telegram_bot(client, username):
     """Send ping to a bot via personal account and wait for a reply."""
     response_received = asyncio.Event()
+    response_msg_id = None
 
     @client.on(events.NewMessage(from_users=username))
     async def handler(event):
+        nonlocal response_msg_id
         if event.message.text.strip().lower() == "ping":
+            response_msg_id = event.message.id
             response_received.set()
 
+    sent_msg = None
     try:
-        await client.send_message(username, "ping")
+        sent_msg = await client.send_message(username, "ping")
         try:
             await asyncio.wait_for(response_received.wait(), timeout=TELEGRAM_RESPONSE_TIMEOUT)
+            # Delete both our ping and the bot's response
+            ids_to_delete = [sent_msg.id]
+            if response_msg_id:
+                ids_to_delete.append(response_msg_id)
+            await client.delete_messages(username, ids_to_delete)
             return True
         except asyncio.TimeoutError:
+            # Delete just our ping
+            await client.delete_messages(username, [sent_msg.id])
             return False
     except Exception as e:
         print(f"Error pinging Telegram bot {username}: {e}")
+        if sent_msg:
+            try:
+                await client.delete_messages(username, [sent_msg.id])
+            except Exception:
+                pass
         return False
     finally:
         client.remove_event_handler(handler)
