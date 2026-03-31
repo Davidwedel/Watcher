@@ -26,13 +26,16 @@ TELEGRAM_PHONE = os.getenv('TELEGRAM_PHONE')
 TELETHON_SESSION_PATH = os.getenv('TELETHON_SESSION_PATH', './data/telegram_session')
 TELEGRAM_BOTS_TO_PING = os.getenv('TELEGRAM_BOTS_TO_PING', '').split(',')
 IP_ADDRESSES_TO_PING = os.getenv('IP_ADDRESSES_TO_PING', '').split(',')
+SYSTEMD_SERVICES = os.getenv('SYSTEMD_SERVICES', '').split(',')
 CHECK_INTERVAL_HOURS = int(os.getenv('CHECK_INTERVAL_HOURS', '24'))
 PING_TIMEOUT = int(os.getenv('PING_TIMEOUT', '5'))
 TELEGRAM_RESPONSE_TIMEOUT = int(os.getenv('TELEGRAM_RESPONSE_TIMEOUT', '30'))
+ANOMALOUS_BOT = os.getenv('ANOMALOUS_BOT', '').strip()
 
 # Filter empty strings
 TELEGRAM_BOTS_TO_PING = [bot.strip() for bot in TELEGRAM_BOTS_TO_PING if bot.strip()]
 IP_ADDRESSES_TO_PING = [ip.strip() for ip in IP_ADDRESSES_TO_PING if ip.strip()]
+SYSTEMD_SERVICES = [svc.strip() for svc in SYSTEMD_SERVICES if svc.strip()]
 
 
 async def ping_ip(address):
@@ -46,6 +49,20 @@ async def ping_ip(address):
         return result.returncode == 0
     except Exception as e:
         print(f"Error pinging {address}: {e}")
+        return False
+
+
+async def check_systemd_service(service):
+    """Check if a systemd service is active."""
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', service],
+            capture_output=True,
+            text=True
+        )
+        return result.stdout.strip() == 'active'
+    except Exception as e:
+        print(f"Error checking systemd service {service}: {e}")
         return False
 
 
@@ -71,11 +88,16 @@ async def check_telegram_bot(client, username):
             if response_msg_id:
                 ids_to_delete.append(response_msg_id)
             await client.delete_messages(username, ids_to_delete)
-            return True
         except asyncio.TimeoutError:
             # Delete just our ping
             await client.delete_messages(username, [sent_msg.id])
             return False
+
+        # For bots that require an extra /checkbell verification
+        if ANOMALOUS_BOT and username.lstrip('@').lower() == ANOMALOUS_BOT.lstrip('@').lower():
+            return await check_bell(client, username)
+
+        return True
     except Exception as e:
         print(f"Error pinging Telegram bot {username}: {e}")
         if sent_msg:
@@ -86,6 +108,48 @@ async def check_telegram_bot(client, username):
         return False
     finally:
         client.remove_event_handler(handler)
+
+
+async def check_bell(client, username):
+    """Send /checkbell to a bot and verify it responds with 'bell checked'."""
+    bell_response_received = asyncio.Event()
+    bell_ok = False
+    bell_msg_ids = []
+
+    @client.on(events.NewMessage(from_users=username))
+    async def bell_handler(event):
+        nonlocal bell_ok
+        text = event.message.text.strip().lower()
+        if text in ("bell checked", "bell check failed"):
+            bell_ok = text == "bell checked"
+            bell_msg_ids.append(event.message.id)
+            bell_response_received.set()
+
+    sent_msg = None
+    try:
+        sent_msg = await client.send_message(username, "/checkbell")
+        try:
+            await asyncio.wait_for(bell_response_received.wait(), timeout=TELEGRAM_RESPONSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            bell_ok = False
+        finally:
+            ids_to_delete = []
+            if sent_msg:
+                ids_to_delete.append(sent_msg.id)
+            ids_to_delete.extend(bell_msg_ids)
+            if ids_to_delete:
+                await client.delete_messages(username, ids_to_delete)
+        return bell_ok
+    except Exception as e:
+        print(f"Error running /checkbell on {username}: {e}")
+        if sent_msg:
+            try:
+                await client.delete_messages(username, [sent_msg.id])
+            except Exception:
+                pass
+        return False
+    finally:
+        client.remove_event_handler(bell_handler)
 
 
 async def send_notification(bot, message):
@@ -106,6 +170,15 @@ async def run_checks(client):
     failures = []
 
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Running checks...")
+
+    # Check systemd services
+    for service in SYSTEMD_SERVICES:
+        print(f"Checking systemd service: {service}")
+        if not await check_systemd_service(service):
+            failures.append(f"Systemd service not active: `{service}`")
+            print(f"  FAILED")
+        else:
+            print(f"  OK")
 
     # Check IP addresses
     for address in IP_ADDRESSES_TO_PING:
@@ -150,7 +223,7 @@ async def main():
     await client.start(phone=TELEGRAM_PHONE)
 
     print("Watcher started!")
-    print(f"Monitoring {len(IP_ADDRESSES_TO_PING)} IP/domain(s) and {len(TELEGRAM_BOTS_TO_PING)} Telegram bot(s)")
+    print(f"Monitoring {len(IP_ADDRESSES_TO_PING)} IP/domain(s), {len(TELEGRAM_BOTS_TO_PING)} Telegram bot(s), and {len(SYSTEMD_SERVICES)} systemd service(s)")
     print(f"Check interval: {CHECK_INTERVAL_HOURS} hour(s)")
 
     while True:
