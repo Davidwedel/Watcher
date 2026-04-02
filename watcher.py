@@ -10,6 +10,7 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
+import aiohttp
 from telegram import Bot
 from telegram.error import TelegramError
 from telethon import TelegramClient, events
@@ -31,11 +32,111 @@ CHECK_INTERVAL_HOURS = int(os.getenv('CHECK_INTERVAL_HOURS', '24'))
 PING_TIMEOUT = int(os.getenv('PING_TIMEOUT', '5'))
 TELEGRAM_RESPONSE_TIMEOUT = int(os.getenv('TELEGRAM_RESPONSE_TIMEOUT', '30'))
 ANOMALOUS_BOT = os.getenv('ANOMALOUS_BOT', '').strip()
+WEBSITES_TO_CHECK = os.getenv('WEBSITES_TO_CHECK', '').split(',')
+NTRIP_CASTERS_TO_CHECK = os.getenv('NTRIP_CASTERS_TO_CHECK', '').split(',')
 
 # Filter empty strings
 TELEGRAM_BOTS_TO_PING = [bot.strip() for bot in TELEGRAM_BOTS_TO_PING if bot.strip()]
 IP_ADDRESSES_TO_PING = [ip.strip() for ip in IP_ADDRESSES_TO_PING if ip.strip()]
 SYSTEMD_SERVICES = [svc.strip() for svc in SYSTEMD_SERVICES if svc.strip()]
+WEBSITES_TO_CHECK = [url.strip() for url in WEBSITES_TO_CHECK if url.strip()]
+NTRIP_CASTERS_TO_CHECK = [url.strip() for url in NTRIP_CASTERS_TO_CHECK if url.strip()]
+
+
+async def check_website(url):
+    """Check that a website is reachable.
+
+    Tries a standard HTTP GET first. If the server speaks a non-HTTP protocol
+    (e.g. NTRIP casters that reply with 'ICY 200 OK'), falls back to a raw TCP
+    connection check so the port-open state is still verified.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=PING_TIMEOUT), allow_redirects=True) as resp:
+                return resp.status < 400
+    except aiohttp.ClientResponseError as e:
+        return e.status < 400
+    except Exception:
+        # Non-HTTP protocol (e.g. NTRIP/ICY) — fall back to TCP reachability
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=PING_TIMEOUT
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception as e:
+            print(f"Error checking website {url}: {e}")
+            return False
+
+
+async def check_ntrip_caster(url):
+    """Check an NTRIP caster by requesting its sourcetable.
+
+    If the URL includes a mountpoint path (e.g. http://host:2101/MYMOUNT),
+    also verifies that mountpoint appears in the sourcetable.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or 2101
+    mountpoint = parsed.path.strip('/')
+
+    request = (
+        f"GET / HTTP/1.0\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Ntrip-Version: Ntrip/2.0\r\n"
+        f"User-Agent: NTRIP WatcherClient/1.0\r\n"
+        f"\r\n"
+    )
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=PING_TIMEOUT
+        )
+        writer.write(request.encode())
+        await writer.drain()
+        # Read until ENDSOURCETABLE or connection closes (sourcetable can be very large)
+        chunks = []
+        while True:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=PING_TIMEOUT)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b'ENDSOURCETABLE' in chunk:
+                break
+        response = b''.join(chunks)
+        writer.close()
+        await writer.wait_closed()
+
+        text = response.decode(errors='ignore')
+        first_line = text.split('\r\n')[0].upper()
+        caster_up = 'SOURCETABLE 200' in first_line or 'ICY 200' in first_line or 'HTTP/1' in first_line
+        if not caster_up:
+            return False
+
+        if mountpoint:
+            # Each stream entry starts with STR;MOUNTPOINT;
+            mountpoints = {
+                line.split(';')[1]
+                for line in text.splitlines()
+                if line.startswith('STR;') and len(line.split(';')) > 1
+            }
+            if mountpoint not in mountpoints:
+                print(f"  Mountpoint '{mountpoint}' not found in sourcetable (available: {', '.join(sorted(mountpoints)) or 'none'})")
+                return False
+
+        return True
+    except Exception as e:
+        print(f"Error checking NTRIP caster {url}: {e}")
+        return False
 
 
 async def ping_ip(address):
@@ -171,6 +272,24 @@ async def run_checks(client):
 
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Running checks...")
 
+    # Check NTRIP casters
+    for url in NTRIP_CASTERS_TO_CHECK:
+        print(f"Checking NTRIP caster: {url}")
+        if not await check_ntrip_caster(url):
+            failures.append(f"NTRIP caster down: `{url}`")
+            print(f"  FAILED")
+        else:
+            print(f"  OK")
+
+    # Check websites
+    for url in WEBSITES_TO_CHECK:
+        print(f"Checking website: {url}")
+        if not await check_website(url):
+            failures.append(f"Website down: `{url}`")
+            print(f"  FAILED")
+        else:
+            print(f"  OK")
+
     # Check systemd services
     for service in SYSTEMD_SERVICES:
         print(f"Checking systemd service: {service}")
@@ -223,7 +342,7 @@ async def main():
     await client.start(phone=TELEGRAM_PHONE)
 
     print("Watcher started!")
-    print(f"Monitoring {len(IP_ADDRESSES_TO_PING)} IP/domain(s), {len(TELEGRAM_BOTS_TO_PING)} Telegram bot(s), and {len(SYSTEMD_SERVICES)} systemd service(s)")
+    print(f"Monitoring {len(NTRIP_CASTERS_TO_CHECK)} NTRIP caster(s), {len(WEBSITES_TO_CHECK)} website(s), {len(IP_ADDRESSES_TO_PING)} IP/domain(s), {len(TELEGRAM_BOTS_TO_PING)} Telegram bot(s), and {len(SYSTEMD_SERVICES)} systemd service(s)")
     print(f"Check interval: {CHECK_INTERVAL_HOURS} hour(s)")
 
     while True:
