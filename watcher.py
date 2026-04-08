@@ -188,9 +188,11 @@ async def check_telegram_bot(client, username):
             ids_to_delete = [sent_msg.id]
             if response_msg_id:
                 ids_to_delete.append(response_msg_id)
+            await client.send_read_acknowledge(username)
             await client.delete_messages(username, ids_to_delete)
         except asyncio.TimeoutError:
             # Delete just our ping
+            await client.send_read_acknowledge(username)
             await client.delete_messages(username, [sent_msg.id])
             return False
 
@@ -239,6 +241,7 @@ async def check_bell(client, username):
                 ids_to_delete.append(sent_msg.id)
             ids_to_delete.extend(bell_msg_ids)
             if ids_to_delete:
+                await client.send_read_acknowledge(username)
                 await client.delete_messages(username, ids_to_delete)
         return bell_ok
     except Exception as e:
